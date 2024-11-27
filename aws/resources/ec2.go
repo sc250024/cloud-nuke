@@ -2,12 +2,15 @@ package resources
 
 import (
 	"context"
-	"github.com/gruntwork-io/cloud-nuke/util"
+	"time"
 
-	awsgo "github.com/aws/aws-sdk-go/aws"
-	"github.com/aws/aws-sdk-go/service/ec2"
+	"github.com/aws/aws-sdk-go-v2/aws"
+	"github.com/aws/aws-sdk-go-v2/service/ec2"
+	"github.com/aws/aws-sdk-go-v2/service/ec2/types"
+
 	"github.com/gruntwork-io/cloud-nuke/config"
 	"github.com/gruntwork-io/cloud-nuke/logging"
+	"github.com/gruntwork-io/cloud-nuke/util"
 	"github.com/gruntwork-io/go-commons/errors"
 )
 
@@ -18,9 +21,9 @@ func (ei *EC2Instances) filterOutProtectedInstances(output *ec2.DescribeInstance
 		for _, instance := range reservation.Instances {
 			instanceID := *instance.InstanceId
 
-			attr, err := ei.Client.DescribeInstanceAttributeWithContext(ei.Context, &ec2.DescribeInstanceAttributeInput{
-				Attribute:  awsgo.String("disableApiTermination"),
-				InstanceId: awsgo.String(instanceID),
+			attr, err := ei.Client.DescribeInstanceAttribute(ei.Context, &ec2.DescribeInstanceAttributeInput{
+				Attribute:  "disableApiTermination",
+				InstanceId: aws.String(instanceID),
 			})
 			if err != nil {
 				return nil, errors.WithStackTrace(err)
@@ -38,18 +41,18 @@ func (ei *EC2Instances) filterOutProtectedInstances(output *ec2.DescribeInstance
 // Returns a formatted string of EC2 instance ids
 func (ei *EC2Instances) getAll(c context.Context, configObj config.Config) ([]*string, error) {
 	params := &ec2.DescribeInstancesInput{
-		Filters: []*ec2.Filter{
+		Filters: []types.Filter{
 			{
-				Name: awsgo.String("instance-state-name"),
-				Values: []*string{
-					awsgo.String("running"), awsgo.String("pending"),
-					awsgo.String("stopped"), awsgo.String("stopping"),
+				Name: aws.String("instance-state-name"),
+				Values: []string{
+					"running", "pending",
+					"stopped", "stopping",
 				},
 			},
 		},
 	}
 
-	output, err := ei.Client.DescribeInstancesWithContext(ei.Context, params)
+	output, err := ei.Client.DescribeInstances(ei.Context, params)
 	if err != nil {
 		return nil, errors.WithStackTrace(err)
 	}
@@ -62,7 +65,7 @@ func (ei *EC2Instances) getAll(c context.Context, configObj config.Config) ([]*s
 	return instanceIds, nil
 }
 
-func shouldIncludeInstanceId(instance *ec2.Instance, protected bool, configObj config.Config) bool {
+func shouldIncludeInstanceId(instance types.Instance, protected bool, configObj config.Config) bool {
 	if protected {
 		return false
 	}
@@ -73,7 +76,7 @@ func shouldIncludeInstanceId(instance *ec2.Instance, protected bool, configObj c
 	return configObj.EC2.ShouldInclude(config.ResourceValue{
 		Name: instanceName,
 		Time: instance.LaunchTime,
-		Tags: util.ConvertEC2TagsToMap(instance.Tags),
+		Tags: util.ConvertTypesTagsToMap(instance.Tags),
 	})
 }
 
@@ -82,13 +85,11 @@ func (ei *EC2Instances) releaseEIPs(instanceIds []*string) error {
 	for _, instanceID := range instanceIds {
 
 		// get the elastic ip's associated with the EC2's
-		output, err := ei.Client.DescribeAddressesWithContext(ei.Context, &ec2.DescribeAddressesInput{
-			Filters: []*ec2.Filter{
+		output, err := ei.Client.DescribeAddresses(ei.Context, &ec2.DescribeAddressesInput{
+			Filters: []types.Filter{
 				{
-					Name: awsgo.String("instance-id"),
-					Values: []*string{
-						instanceID,
-					},
+					Name:   aws.String("instance-id"),
+					Values: []string{aws.ToString(instanceID)},
 				},
 			},
 		})
@@ -97,7 +98,7 @@ func (ei *EC2Instances) releaseEIPs(instanceIds []*string) error {
 		}
 
 		for _, address := range output.Addresses {
-			_, err := ei.Client.ReleaseAddressWithContext(ei.Context, &ec2.ReleaseAddressInput{
+			_, err := ei.Client.ReleaseAddress(ei.Context, &ec2.ReleaseAddressInput{
 				AllocationId: address.AllocationId,
 			})
 
@@ -130,30 +131,32 @@ func (ei *EC2Instances) nukeAll(instanceIds []*string) error {
 	logging.Debugf("Terminating all EC2 instances in region %s", ei.Region)
 
 	params := &ec2.TerminateInstancesInput{
-		InstanceIds: instanceIds,
+		InstanceIds: aws.ToStringSlice(instanceIds),
 	}
 
-	_, err = ei.Client.TerminateInstancesWithContext(ei.Context, params)
+	_, err = ei.Client.TerminateInstances(ei.Context, params)
 	if err != nil {
 		logging.Debugf("[Failed] %s", err)
 		return errors.WithStackTrace(err)
 	}
 
-	err = ei.Client.WaitUntilInstanceTerminatedWithContext(ei.Context, &ec2.DescribeInstancesInput{
-		Filters: []*ec2.Filter{
+	waiter := ec2.NewInstanceTerminatedWaiter(ei.Client)
+	err = waiter.Wait(ei.Context, &ec2.DescribeInstancesInput{
+		Filters: []types.Filter{
 			{
-				Name:   awsgo.String("instance-id"),
-				Values: instanceIds,
+				Name:   aws.String("instance-id"),
+				Values: aws.ToStringSlice(instanceIds),
 			},
 		},
-	})
-	for _, instanceID := range instanceIds {
-		logging.Debugf("Terminated EC2 Instance: %s", *instanceID)
-	}
+	}, 15*time.Minute)
 
 	if err != nil {
 		logging.Debugf("[Failed] %s", err)
 		return errors.WithStackTrace(err)
+	}
+
+	for _, instanceID := range instanceIds {
+		logging.Debugf("Terminated EC2 Instance: %s", *instanceID)
 	}
 
 	logging.Debugf("[OK] %d instance(s) terminated in %s", len(instanceIds), ei.Region)
